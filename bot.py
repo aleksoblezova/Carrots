@@ -20,9 +20,8 @@ import aiosqlite
 # -------------------- КОНСТАНТЫ --------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 BOT_USERNAME = "carrrotssbot"
+OFFICIAL_CHANNEL = "@carrrotss"
 
-# ID администраторов (задайте через переменную окружения ADMIN_IDS, разделяя запятыми)
-# или укажите вручную ниже (замените 123456789 на свой Telegram ID)
 ADMIN_IDS = [5235589433]
 admin_ids_str = os.getenv("ADMIN_IDS")
 if admin_ids_str:
@@ -31,19 +30,17 @@ if admin_ids_str:
     except:
         pass
 if not ADMIN_IDS:
-    ADMIN_IDS = [5235589433]  # <--- ЗАМЕНИТЕ НА СВОЙ TELEGRAM ID
+    ADMIN_IDS = [5235589433]
     logging.warning("ADMIN_IDS не задан в окружении, используется значение по умолчанию")
 
-START_BONUS = 20
-REFERRAL_BONUS = 50
+START_BONUS = 30
+REFERRAL_BONUS = 80
 REFERRAL_XP_BONUS = 100
-TASK_XP = 10
-DAILY_BASE = 10          # не используется, т.к. бонус теперь фиксированный
-DAILY_MULTIPLIER = 5     # не используется
-LEVEL_UP_REWARD = 20
-CONVERSION_RATE = 1000
+TASK_XP = 20
+LEVEL_UP_REWARD = 25
+CONVERSION_RATE = 100
 MIN_CONVERT_AMOUNT = 1000
-XP_PER_LEVEL = 1000
+XP_PER_LEVEL = 800
 
 REFERRAL_PERCENTS = {
     (1, 2): 5,
@@ -51,6 +48,9 @@ REFERRAL_PERCENTS = {
     (6, 10): 10,
     (11, float('inf')): 12
 }
+
+RETENTION_DAYS = 3
+PENALTY_PERCENT = 100
 
 SHOP_ITEMS = [
     {"name": "Смена имени", "price": 200, "description": "Позволяет изменить имя в профиле"},
@@ -73,9 +73,6 @@ router = Router()
 db_path = "bot.db"
 
 # -------------------- БАЗА ДАННЫХ --------------------
-async def get_db() -> aiosqlite.Connection:
-    return await aiosqlite.connect(db_path)
-
 async def create_tables():
     async with aiosqlite.connect(db_path) as db:
         await db.execute("""
@@ -99,9 +96,7 @@ async def create_tables():
             CREATE TABLE IF NOT EXISTS referrals (
                 referrer_id INTEGER,
                 referral_id INTEGER,
-                PRIMARY KEY (referrer_id, referral_id),
-                FOREIGN KEY(referrer_id) REFERENCES users(user_id),
-                FOREIGN KEY(referral_id) REFERENCES users(user_id)
+                PRIMARY KEY (referrer_id, referral_id)
             )
         """)
         await db.execute("""
@@ -118,9 +113,8 @@ async def create_tables():
                 user_id INTEGER,
                 task_id INTEGER,
                 completed_at TEXT,
-                PRIMARY KEY (user_id, task_id),
-                FOREIGN KEY(user_id) REFERENCES users(user_id),
-                FOREIGN KEY(task_id) REFERENCES tasks(id)
+                retention_checked INTEGER DEFAULT 0,
+                PRIMARY KEY (user_id, task_id)
             )
         """)
         await db.execute("""
@@ -129,8 +123,7 @@ async def create_tables():
                 user_id INTEGER,
                 carrot_amount INTEGER,
                 rub_amount INTEGER,
-                timestamp TEXT,
-                FOREIGN KEY(user_id) REFERENCES users(user_id)
+                timestamp TEXT
             )
         """)
         await db.commit()
@@ -144,7 +137,6 @@ async def populate_tasks():
                 await db.execute("INSERT INTO tasks (title, type, target, reward) VALUES (?, ?, ?, ?)",
                                  (task["title"], task["type"], task["target"], task["reward"]))
             await db.commit()
-            logger.info("Таблица tasks заполнена начальными заданиями")
 
 # -------------------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ --------------------
 def get_referral_percent(referral_count: int) -> int:
@@ -235,12 +227,6 @@ async def complete_task(user_id: int, task_id: int):
                          (user_id, task_id, now))
         await db.commit()
 
-async def get_task_reward(task_id: int) -> int:
-    async with aiosqlite.connect(db_path) as db:
-        cursor = await db.execute("SELECT reward FROM tasks WHERE id = ?", (task_id,))
-        row = await cursor.fetchone()
-        return row[0] if row else 0
-
 async def process_task_reward(user_id: int, task_id: int, base_reward: int) -> int:
     user = await get_user(user_id)
     if not user:
@@ -276,23 +262,85 @@ async def process_task_reward(user_id: int, task_id: int, base_reward: int) -> i
                 await update_user_balance(referrer_id, carrot_delta=ref_bonus)
     return final_reward
 
-# -------------------- FSM --------------------
-class Registration(StatesGroup):
-    waiting_for_name = State()
-    waiting_for_age = State()
-    waiting_for_city = State()
+# -------------------- ПРОВЕРКА УДЕРЖАНИЯ (ШТРАФЫ) --------------------
+async def check_retention_penalties(user_id: int, bot: Bot):
+    async with aiosqlite.connect(db_path) as db:
+        cursor = await db.execute("""
+            SELECT ct.task_id, ct.completed_at, t.type, t.target, t.reward
+            FROM completed_tasks ct
+            JOIN tasks t ON ct.task_id = t.id
+            WHERE ct.user_id = ? AND ct.retention_checked = 0
+              AND datetime(ct.completed_at) <= datetime('now', ? || ' days')
+        """, (user_id, f'-{RETENTION_DAYS}'))
+        rows = await cursor.fetchall()
 
+        for task_id, completed_at, task_type, target, reward in rows:
+            if task_type not in ("subscribe_channel", "join_group"):
+                await db.execute("UPDATE completed_tasks SET retention_checked = 1 WHERE user_id = ? AND task_id = ?",
+                                 (user_id, task_id))
+                continue
+
+            subscribed = False
+            try:
+                member = await bot.get_chat_member(chat_id=target, user_id=user_id)
+                if member.status in ["member", "administrator", "creator"]:
+                    subscribed = True
+            except Exception as e:
+                logger.error(f"Retention check error for task {task_id}: {e}")
+                continue
+
+            if subscribed:
+                await db.execute("UPDATE completed_tasks SET retention_checked = 1 WHERE user_id = ? AND task_id = ?",
+                                 (user_id, task_id))
+            else:
+                penalty = math.floor(reward * PENALTY_PERCENT / 100)
+                user = await get_user(user_id)
+                if user:
+                    current = user["balance_carrots"]
+                    if current >= penalty:
+                        await update_user_balance(user_id, carrot_delta=-penalty)
+                    else:
+                        if current > 0:
+                            await update_user_balance(user_id, carrot_delta=-current)
+                        penalty = current
+                await db.execute("DELETE FROM completed_tasks WHERE user_id = ? AND task_id = ?",
+                                 (user_id, task_id))
+                try:
+                    await bot.send_message(
+                        user_id,
+                        f"⚠️ Ты отписался от «{target}» в течение {RETENTION_DAYS} дней после выполнения задания.\n"
+                        f"Списываем штраф: -{penalty} 🥕.\n"
+                        "Задание снова доступно для выполнения (если подпишешься снова)."
+                    )
+                except:
+                    pass
+        await db.commit()
+
+# -------------------- FSM --------------------
 class ChangeName(StatesGroup):
     waiting_for_new_name = State()
 
 class ConvertState(StatesGroup):
     waiting_for_amount = State()
 
-# FSM для админ-команд
 class AdminStates(StatesGroup):
     waiting_for_task_data = State()
 
 # -------------------- ОБРАБОТЧИКИ --------------------
+async def is_subscribed(bot: Bot, user_id: int, channel: str) -> bool:
+    try:
+        member = await bot.get_chat_member(chat_id=channel, user_id=user_id)
+        return member.status in ["member", "administrator", "creator"]
+    except:
+        return False
+
+def subscription_keyboard() -> InlineKeyboardMarkup:
+    buttons = [
+        [InlineKeyboardButton(text="🔔 Подписаться", url=f"https://t.me/{OFFICIAL_CHANNEL.lstrip('@')}")],
+        [InlineKeyboardButton(text="✅ Проверить подписку", callback_data="check_sub")]
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
 @router.message(CommandStart())
 async def cmd_start(message: types.Message, state: FSMContext, bot: Bot):
     user_id = message.from_user.id
@@ -307,52 +355,42 @@ async def cmd_start(message: types.Message, state: FSMContext, bot: Bot):
     existing_user = await get_user(user_id)
     if existing_user:
         await state.clear()
+        await check_retention_penalties(user_id, bot)
         await show_main_menu(message)
         return
 
-    await state.update_data(referrer_id=referrer_id)
-    await message.answer("Добро пожаловать! Давай познакомимся. Как тебя зовут?")
-    await state.set_state(Registration.waiting_for_name)
+    if await is_subscribed(bot, user_id, OFFICIAL_CHANNEL):
+        name = message.from_user.full_name or "Пользователь"
+        await add_user(user_id, name, 0, "", referrer_id)
+        await state.clear()
+        await message.answer(f"✅ Подписка подтверждена! Добро пожаловать, {name}!")
+        await message.answer(f"Тебе начислено {START_BONUS} 🥕 стартового бонуса.")
+        await show_main_menu(message)
+    else:
+        await message.answer(
+            "👋 Чтобы пользоваться ботом, нужно подписаться на наш официальный канал.\n"
+            "Нажми кнопку ниже, подпишись и затем проверь подписку.",
+            reply_markup=subscription_keyboard()
+        )
 
-@router.message(Registration.waiting_for_name, F.text)
-async def process_name(message: types.Message, state: FSMContext):
-    name = message.text.strip()
-    if not name:
-        await message.answer("Имя не может быть пустым. Введи ещё раз:")
+@router.callback_query(F.data == "check_sub")
+async def check_subscription_callback(callback: types.CallbackQuery, bot: Bot):
+    user_id = callback.from_user.id
+    if await get_user(user_id):
+        await callback.answer("Вы уже зарегистрированы!", show_alert=True)
+        await show_main_menu(callback.message)
         return
-    await state.update_data(name=name)
-    await message.answer("Сколько тебе лет? (целое число)")
-    await state.set_state(Registration.waiting_for_age)
 
-@router.message(Registration.waiting_for_age, F.text)
-async def process_age(message: types.Message, state: FSMContext):
-    try:
-        age = int(message.text)
-        if age < 5 or age > 120:
-            raise ValueError
-    except ValueError:
-        await message.answer("Пожалуйста, введи корректный возраст (число от 5 до 120):")
-        return
-    await state.update_data(age=age)
-    await message.answer("Из какого ты города?")
-    await state.set_state(Registration.waiting_for_city)
-
-@router.message(Registration.waiting_for_city, F.text)
-async def process_city(message: types.Message, state: FSMContext, bot: Bot):
-    city = message.text.strip()
-    if not city:
-        await message.answer("Город не может быть пустым. Введи ещё раз:")
-        return
-    user_data = await state.get_data()
-    name = user_data["name"]
-    age = user_data["age"]
-    referrer_id = user_data.get("referrer_id")
-    user_id = message.from_user.id
-
-    await add_user(user_id, name, age, city, referrer_id)
-    await state.clear()
-    await message.answer(f"Регистрация завершена! Тебе начислено {START_BONUS} 🥕.")
-    await show_main_menu(message)
+    if await is_subscribed(bot, user_id, OFFICIAL_CHANNEL):
+        name = callback.from_user.full_name or "Пользователь"
+        await add_user(user_id, name, 0, "", None)
+        await callback.message.edit_text(
+            f"✅ Подписка подтверждена! Добро пожаловать, {name}!\n"
+            f"Тебе начислено {START_BONUS} 🥕 стартового бонуса."
+        )
+        await show_main_menu(callback.message)
+    else:
+        await callback.answer("Вы ещё не подписаны на канал. Подпишитесь и попробуйте снова.", show_alert=True)
 
 def main_keyboard() -> ReplyKeyboardMarkup:
     buttons = [
@@ -369,6 +407,19 @@ def main_keyboard() -> ReplyKeyboardMarkup:
 async def show_main_menu(message: types.Message):
     await message.answer("Главное меню:", reply_markup=main_keyboard())
 
+# -------------------- ОТМЕНА ДЕЙСТВИЯ (ТОЛЬКО ДЛЯ АДМИНА) --------------------
+@router.message(Command("cancel"))
+async def cancel_admin_task_add(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    current_state = await state.get_state()
+    if current_state == "AdminStates:waiting_for_task_data":
+        await state.clear()
+        await message.answer("❌ Добавление задания отменено.")
+        await show_main_menu(message)
+    else:
+        await message.answer("Нет активного действия для отмены (администратором).")
+
 # -------------------- ПРОФИЛЬ --------------------
 @router.message(F.text == "👤 Профиль")
 async def profile(message: types.Message):
@@ -376,6 +427,7 @@ async def profile(message: types.Message):
     if not user:
         await message.answer("Сначала зарегистрируйтесь: /start")
         return
+    await check_retention_penalties(message.from_user.id, message.bot)
     ref_count = await get_referral_count(user["user_id"])
     percent = get_referral_percent(ref_count)
     premium_status = "🌟 Премиум" if user["premium"] else "Обычный"
@@ -405,7 +457,7 @@ async def profile(message: types.Message):
     )
     await message.answer(text)
 
-# -------------------- ЕЖЕДНЕВНЫЙ БОНУС (изменён на 50) --------------------
+# -------------------- ЕЖЕДНЕВНЫЙ БОНУС --------------------
 @router.message(F.text == "🎁 Ежедневный бонус")
 async def daily_bonus(message: types.Message):
     user = await get_user(message.from_user.id)
@@ -417,7 +469,7 @@ async def daily_bonus(message: types.Message):
         await message.answer("Ты уже получил бонус сегодня. Приходи завтра!")
         return
 
-    bonus = 50  # <--- ИЗМЕНЕНО: теперь всегда 50
+    bonus = 50
     async with aiosqlite.connect(db_path) as db:
         await db.execute("UPDATE users SET balance_carrots = balance_carrots + ?, last_bonus_date = ? WHERE user_id = ?",
                          (bonus, today, user["user_id"]))
@@ -426,24 +478,59 @@ async def daily_bonus(message: types.Message):
 
 # -------------------- ЗАДАНИЯ --------------------
 @router.message(F.text == "🥕 Задания")
-async def tasks_list(message: types.Message):
+async def tasks_list(message: types.Message, bot: Bot):
     user_id = message.from_user.id
+    await check_retention_penalties(user_id, bot)
+
     async with aiosqlite.connect(db_path) as db:
         cursor = await db.execute("SELECT id, title, type, reward FROM tasks")
         tasks = await cursor.fetchall()
     if not tasks:
         await message.answer("Заданий пока нет.")
         return
+
+    # Предупреждение перед списком заданий
+    await message.answer(
+        f"⚠️ Внимание: если вы отпишетесь от канала/группы в течение {RETENTION_DAYS} дней "
+        "после выполнения задания, с вас будет списана полная сумма награды."
+    )
+
     for task_id, title, task_type, reward in tasks:
         done = await is_task_completed(user_id, task_id)
-        status = "✅" if done else "🔄"
+        status = ""
+        if done:
+            # Для inline_button просто показываем выполнение без удержания
+            if task_type == "inline_button":
+                status = "✅"
+            else:
+                async with aiosqlite.connect(db_path) as db2:
+                    c = await db2.execute(
+                        "SELECT completed_at, retention_checked FROM completed_tasks WHERE user_id=? AND task_id=?",
+                        (user_id, task_id)
+                    )
+                    row = await c.fetchone()
+                if row:
+                    comp_date = datetime.fromisoformat(row[0])
+                    retention_checked = row[1]
+                    days_passed = (datetime.now() - comp_date).days
+                    if retention_checked == 0:
+                        if days_passed < RETENTION_DAYS:
+                            status = f"⏳ Удержание: {RETENTION_DAYS - days_passed} дн."
+                        else:
+                            status = "⏳ Проверка..."
+                    elif retention_checked == 1:
+                        status = "✅ Успешно"
+                    else:
+                        status = "⚠️ Штраф"
+                else:
+                    status = "✅"
+        text = f"{status} {title} (Награда: {reward} 🥕)" if status else f"{title} (Награда: {reward} 🥕)"
         if not done:
             kb = InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text=f"Выполнить ({reward} 🥕)", callback_data=f"do_task_{task_id}")]
             ])
         else:
             kb = None
-        text = f"{status} {title} (Награда: {reward} 🥕)"
         await message.answer(text, reply_markup=kb)
 
 @router.callback_query(F.data.startswith("do_task_"))
@@ -672,16 +759,14 @@ async def withdraw_check(message: types.Message):
         text = "Не все условия выполнены:\n" + "\n".join(conditions)
     await message.answer(text)
 
-# -------------------- АДМИНИСТРАТИВНЫЕ КОМАНДЫ (ДОБАВЛЕНЫ) --------------------
-# Проверка прав администратора
+# -------------------- АДМИН-КОМАНДЫ --------------------
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
-# /add_task – запускает диалог добавления задания
 @router.message(Command("add_task"))
 async def add_task_start(message: types.Message, state: FSMContext):
     if not is_admin(message.from_user.id):
-        await message.answer("⛔ У вас нет прав на эту команду.")
+        await message.answer("⛔ У вас нет прав.")
         return
     await message.answer(
         "📝 Введите данные нового задания в формате:\n\n"
@@ -692,7 +777,6 @@ async def add_task_start(message: types.Message, state: FSMContext):
     )
     await state.set_state(AdminStates.waiting_for_task_data)
 
-# Обработка введённых данных для добавления задания
 @router.message(AdminStates.waiting_for_task_data, F.text)
 async def add_task_process(message: types.Message, state: FSMContext):
     if not is_admin(message.from_user.id):
@@ -726,7 +810,6 @@ async def add_task_process(message: types.Message, state: FSMContext):
     await state.clear()
     await message.answer(f"✅ Задание «{title}» успешно добавлено!")
 
-# /list_tasks – список всех заданий
 @router.message(Command("list_tasks"))
 async def list_tasks(message: types.Message):
     if not is_admin(message.from_user.id):
@@ -743,7 +826,6 @@ async def list_tasks(message: types.Message):
         text += f"ID: {row[0]} | {row[1]} | Награда: {row[2]} 🥕\n"
     await message.answer(text)
 
-# /remove_task <id> – удаление задания по ID
 @router.message(Command("remove_task"))
 async def remove_task(message: types.Message):
     if not is_admin(message.from_user.id):
@@ -758,8 +840,8 @@ async def remove_task(message: types.Message):
     except ValueError:
         await message.answer("❌ ID должен быть числом.")
         return
+
     async with aiosqlite.connect(db_path) as db:
-        # Проверим, существует ли задание
         cursor = await db.execute("SELECT title FROM tasks WHERE id = ?", (task_id,))
         row = await cursor.fetchone()
         if not row:
@@ -767,25 +849,13 @@ async def remove_task(message: types.Message):
             return
         title = row[0]
         await db.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+        await db.execute("DELETE FROM completed_tasks WHERE task_id = ?", (task_id,))
         await db.commit()
-    await message.answer(f"✅ Задание «{title}» (ID {task_id}) удалено.")
-
-# /cancel – отмена текущего действия (для администратора)
-@router.message(Command("cancel"))
-async def cancel_admin(message: types.Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
-        return
-    current_state = await state.get_state()
-    if current_state is None:
-        await message.answer("Нет активного действия.")
-        return
-    await state.clear()
-    await message.answer("❌ Действие отменено.")
+    await message.answer(f"✅ Задание «{title}» (ID {task_id}) удалено вместе с историей выполнений.")
 
 # -------------------- НЕИЗВЕСТНЫЕ СООБЩЕНИЯ --------------------
 @router.message()
 async def unknown(message: types.Message, state: FSMContext):
-    # Ничего не делаем — во время анкеты не мешаем, в остальном тоже не спамим
     pass
 
 # -------------------- ЗАПУСК --------------------
